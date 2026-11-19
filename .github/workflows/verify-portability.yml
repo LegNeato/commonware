@@ -1,0 +1,74 @@
+name: Recovery portability
+on:
+  push:
+    branches: [verify-portability]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  wasm:
+    name: WASM / ${{ matrix.candidate }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - candidate: storage
+            head: 087403af1cbc404b414cb06d8c4e9ac37efbd594
+          - candidate: simplex
+            head: 1f99c2cad78dc3fde2fb9363169655efaa2f7e01
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          ref: ${{ matrix.head }}
+          persist-credentials: false
+      - uses: ./.github/actions/swap
+      - uses: ./.github/actions/setup
+        with:
+          targets: wasm32-unknown-unknown
+          rust-cache-enabled: 'false'
+      - name: Build consensus
+        run: cargo rustc --target wasm32-unknown-unknown --release --manifest-path consensus/Cargo.toml --crate-type cdylib && du -h "${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release/commonware_consensus.wasm"
+      - name: Build storage
+        run: cargo rustc --target wasm32-unknown-unknown --release --manifest-path storage/Cargo.toml --crate-type cdylib && du -h "${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release/commonware_storage.wasm"
+      - name: Verify dependency lock
+        run: git diff --exit-code -- Cargo.lock
+
+  no-std:
+    name: Without std / storage
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          ref: 087403af1cbc404b414cb06d8c4e9ac37efbd594
+          persist-credentials: false
+      - uses: ./.github/actions/swap
+      - uses: ./.github/actions/setup
+        with:
+          additional-cache-key: '--no-default-features'
+          rust-cache-enabled: 'false'
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-nextest@0.9.133
+      - name: Test the changed package declaring a std feature
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=$(cargo metadata --format-version 1 --no-deps |
+            jq -r '.packages[] | select((.name == "commonware-consensus" or .name == "commonware-storage") and (.features | has("std"))) | .name')
+          [[ "$packages" == commonware-storage ]]
+          package="$packages"
+          features=$(cargo tree --locked -p "$package" --no-default-features -e features -i "$package" --prefix none)
+          if grep -q "^$package feature \"std\"" <<< "$features"; then
+            echo "$package: a dependency re-enables std" >&2
+            exit 1
+          fi
+          cargo nextest run -p "$package" --no-default-features --verbose
+          cargo test --doc --locked -p "$package" --no-default-features
+          git diff --exit-code -- Cargo.lock
