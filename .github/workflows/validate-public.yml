@@ -1,0 +1,141 @@
+name: Recovery verification
+on:
+  push:
+    branches: [verify-storage, verify-simplex, verify-backports]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: ${{ matrix.suite }} / ${{ matrix.check }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(github.ref_name == 'verify-storage' && '["storage"]' || github.ref_name == 'verify-simplex' && '["simplex"]' || '["storage","simplex"]') }}
+        check: [tests, lint]
+    env:
+      SUITE: ${{ matrix.suite }}
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select immutable candidate
+        shell: python
+        run: |
+          import json, os, re, subprocess
+          from pathlib import Path
+          branch = {
+              "verify-storage": "storage-recovery",
+              "verify-simplex": "simplex-recovery",
+              "verify-backports": "maintenance-2026.9",
+          }[os.environ["GITHUB_REF_NAME"]]
+          pins = json.loads(Path(".github/recovery-check.json").read_text())
+          base, head = pins["base"], pins["head"]
+          if base == head or not all(re.fullmatch("[0-9a-f]{40}", s) for s in (base, head)):
+              raise SystemExit("Expected two distinct full commit hashes")
+          def git(*args):
+              subprocess.run(["git", *args], check=True)
+          git("merge-base", "--is-ancestor", base, head)
+          git("merge-base", "--is-ancestor", head, "refs/remotes/origin/" + branch)
+          git("checkout", "--detach", head)
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              print("BASE=" + base, file=env)
+              print("PACKAGE=commonware-" + {"storage": "storage", "simplex": "consensus"}[os.environ["SUITE"]], file=env)
+          print(f"Checking {branch} at {head} against {base}", flush=True)
+      - name: Install test toolchain
+        if: matrix.check == 'tests'
+        run: rustup toolchain install 1.100.0 --profile minimal
+      - name: Check formatting and Clippy
+        if: matrix.check == 'lint'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-11-12 --profile minimal --component rustfmt
+          rustup toolchain install 1.100.0 --profile minimal --component clippy
+          crate=storage
+          if [[ $SUITE == simplex ]]; then crate=consensus; fi
+          git diff --name-only --diff-filter=ACMR -z "$BASE" HEAD -- "$crate/" |
+            while IFS= read -r -d '' path; do
+              if [[ $path == *.rs ]]; then rustfmt +nightly-2026-11-12 --edition 2024 --check "$path"; fi
+            done
+          cargo +1.100.0 clippy --locked -p "$PACKAGE" --lib --tests -- -D warnings
+      - name: Demonstrate baseline failure, then verify fixed behavior
+        if: matrix.check == 'tests'
+        shell: python
+        run: |
+          import json, os, re, subprocess
+          from pathlib import Path
+          suite = os.environ["SUITE"]
+          root = Path.cwd()
+          if suite == "storage":
+              production = "storage/src/metadata/storage.rs"
+              regressions = ["metadata::tests::test_recovery_keeps_checksum_bytes_out_of_the_value",
+                             "metadata::tests::test_recovery_rejects_duplicate_decoded_keys"]
+              controls = ["metadata::tests::test_recover_corrupted_one", "metadata::tests::test_recover_corrupted_both"]
+          else:
+              production = "consensus/src/simplex/engine.rs"
+              regressions = ["simplex::tests::test_graceful_shutdown_ed25519_slow_"]
+              controls = ["simplex::tests::test_children_shutdown_on_engine_abort_ed25519_slow_",
+                          "simplex::tests::network_failure_stops_engine_with_pending_voter_sync"]
+
+          def build():
+              cmd = ["cargo", "+1.100.0", "test", "--locked", "-p", os.environ["PACKAGE"],
+                     "--lib", "--no-run", "--message-format=json-render-diagnostics"]
+              output = subprocess.check_output(cmd, text=True)
+              events = [json.loads(line) for line in output.splitlines()]
+              package = root / production.split("/")[0]
+              binaries = [e["executable"] for e in events
+                          if e["reason"] == "compiler-artifact" and e["profile"]["test"]
+                          and e["target"]["kind"] == ["lib"] and e.get("executable")
+                          and e["manifest_path"] == str(package / "Cargo.toml")
+                          and e["target"]["src_path"] == str(package / "src/lib.rs")]
+              binary, = binaries
+              lines = subprocess.check_output([binary, "--list", "--format=terse"], cwd=package, text=True).splitlines()
+              for case in regressions + controls:
+                  if lines.count(case + ": test") != 1:
+                      raise SystemExit(f"Expected exactly one registration for {case}")
+              return binary, package, [s[:-6] for s in lines if s.endswith(": test")]
+
+          def run(artifact, filters, expected, passing):
+              exe, cwd, _ = artifact
+              cmd = [exe, *filters, "--test-threads=2", "--format=pretty", "--color=never"]
+              proc = subprocess.run(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, timeout=1200)
+              print(proc.stdout, flush=True)
+              status = "ok" if passing else "FAILED"
+              count = len(expected)
+              summary = (rf"test result: {status}\. {count if passing else 0} passed; "
+                         rf"{0 if passing else count} failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s")
+              lines = proc.stdout.splitlines()
+              rows = [s for s in lines if s.startswith("test ") and " ... " in s]
+              if (proc.returncode != (0 if passing else 101)
+                      or sorted(rows) != sorted(f"test {case} ... {status}" for case in expected)
+                      or len([s for s in lines if re.fullmatch(summary, s)]) != 1):
+                  raise SystemExit("Missing expected libtest evidence")
+
+          subprocess.run(["git", "restore", "--source=" + os.environ["BASE"], "--", production], check=True)
+          try:
+              baseline = build()
+              for case in regressions:
+                  run(baseline, ["--exact", case], [case], False)
+          finally:
+              subprocess.run(["git", "restore", "--source=HEAD", "--", production], check=True)
+          fixed = build()
+          if suite == "storage":
+              selected = [s for s in fixed[2] if s.startswith("metadata::")]
+              run(fixed, ["--exact", *selected], selected, True)
+          else:
+              selected = regressions + controls
+              for case in selected:
+                  run(fixed, ["--exact", case], [case], True)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              print(f"{suite}: {len(regressions)} expected baseline failures and {len(selected)} candidate passes.", file=summary)
