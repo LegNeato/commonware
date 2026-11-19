@@ -48,26 +48,30 @@ jobs:
           git("merge-base", "--is-ancestor", head, "refs/remotes/origin/" + branch)
           git("checkout", "--detach", head)
           with open(os.environ["GITHUB_ENV"], "a") as env:
+              release = branch == "maintenance-2026.9"
+              # September 3 release CI used floating stable and pinned its rustfmt nightly.
+              print("TEST_TOOLCHAIN=" + ("1.98.1" if release else "1.100.0"), file=env)
+              print("FMT_TOOLCHAIN=" + ("nightly-2026-06-21" if release else "nightly-2026-11-12"), file=env)
               print("BASE=" + base, file=env)
               print("PACKAGE=commonware-" + {"storage": "storage", "simplex": "consensus"}[os.environ["SUITE"]], file=env)
           print(f"Checking {branch} at {head} against {base}", flush=True)
       - name: Install test toolchain
         if: matrix.check == 'tests'
-        run: rustup toolchain install 1.100.0 --profile minimal
+        run: rustup toolchain install "$TEST_TOOLCHAIN" --profile minimal
       - name: Check formatting and Clippy
         if: matrix.check == 'lint'
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install nightly-2026-11-12 --profile minimal --component rustfmt
-          rustup toolchain install 1.100.0 --profile minimal --component clippy
+          rustup toolchain install "$FMT_TOOLCHAIN" --profile minimal --component rustfmt
+          rustup toolchain install "$TEST_TOOLCHAIN" --profile minimal --component clippy
           crate=storage
           if [[ $SUITE == simplex ]]; then crate=consensus; fi
           git diff --name-only --diff-filter=ACMR -z "$BASE" HEAD -- "$crate/" |
             while IFS= read -r -d '' path; do
-              if [[ $path == *.rs ]]; then rustfmt +nightly-2026-11-12 --edition 2024 --check "$path"; fi
+              if [[ $path == *.rs ]]; then rustfmt "+$FMT_TOOLCHAIN" --edition 2024 --check "$path"; fi
             done
-          cargo +1.100.0 clippy --locked -p "$PACKAGE" --lib --tests -- -D warnings
+          cargo "+$TEST_TOOLCHAIN" clippy --locked -p "$PACKAGE" --lib --tests -- -D warnings
       - name: Demonstrate baseline failure, then verify fixed behavior
         if: matrix.check == 'tests'
         shell: python
@@ -83,12 +87,12 @@ jobs:
               controls = ["metadata::tests::test_recover_corrupted_one", "metadata::tests::test_recover_corrupted_both"]
           else:
               production = "consensus/src/simplex/engine.rs"
-              regressions = ["simplex::tests::test_graceful_shutdown_ed25519_slow_"]
-              controls = ["simplex::tests::test_children_shutdown_on_engine_abort_ed25519_slow_",
+              regressions = ["simplex::tests::test_graceful_shutdown_ed25519"]
+              controls = ["simplex::tests::test_children_shutdown_on_engine_abort_ed25519",
                           "simplex::tests::network_failure_stops_engine_with_pending_voter_sync"]
 
           def build():
-              cmd = ["cargo", "+1.100.0", "test", "--locked", "-p", os.environ["PACKAGE"],
+              cmd = ["cargo", "+" + os.environ["TEST_TOOLCHAIN"], "test", "--locked", "-p", os.environ["PACKAGE"],
                      "--lib", "--no-run", "--message-format=json-render-diagnostics"]
               output = subprocess.check_output(cmd, text=True)
               events = [json.loads(line) for line in output.splitlines()]
@@ -100,13 +104,20 @@ jobs:
                           and e["target"]["src_path"] == str(package / "src/lib.rs")]
               binary, = binaries
               lines = subprocess.check_output([binary, "--list", "--format=terse"], cwd=package, text=True).splitlines()
+              names = [s[:-6] for s in lines if s.endswith(": test")]
+              exact = {}
               for case in regressions + controls:
-                  if lines.count(case + ": test") != 1:
-                      raise SystemExit(f"Expected exactly one registration for {case}")
-              return binary, package, [s[:-6] for s in lines if s.endswith(": test")]
+                  choices = {case}
+                  if suite == "simplex" and case.endswith("_ed25519"):
+                      choices.add(case + "_slow_")
+                  matches = [name for name in names if name in choices]
+                  if len(matches) != 1:
+                      raise SystemExit(f"Expected one named registration for {case}, found {matches}")
+                  exact[case] = matches[0]
+              return binary, package, names, exact
 
           def run(artifact, filters, expected, passing):
-              exe, cwd, _ = artifact
+              exe, cwd, _, _ = artifact
               cmd = [exe, *filters, "--test-threads=2", "--format=pretty", "--color=never"]
               proc = subprocess.run(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, timeout=1200)
@@ -116,17 +127,34 @@ jobs:
               summary = (rf"test result: {status}\. {count if passing else 0} passed; "
                          rf"{0 if passing else count} failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s")
               lines = proc.stdout.splitlines()
-              rows = [s for s in lines if s.startswith("test ") and " ... " in s]
+              rows = []
+              for line in lines:
+                  if line.startswith("test ") and " ... " in line:
+                      name, _, outcome = line[5:].rpartition(" ... ")
+                      if passing:
+                          name = name.removesuffix(" - should panic")
+                      rows.append((name, outcome))
               if (proc.returncode != (0 if passing else 101)
-                      or sorted(rows) != sorted(f"test {case} ... {status}" for case in expected)
+                      or sorted(rows) != sorted((case, status) for case in expected)
                       or len([s for s in lines if re.fullmatch(summary, s)]) != 1):
                   raise SystemExit("Missing expected libtest evidence")
+              if not passing:
+                  flat = "".join(proc.stdout.split())
+                  if suite == "storage":
+                      codec = "U64,u16" if "checksum" in expected[0] else "u8,u8"
+                      evidence = "assertionfailed:matches!(" in flat and f"Metadata::<_,{codec}>" in flat
+                  else:
+                      evidence = ("assertion failed:" in proc.stdout and "now_or_never().is_none()" in flat
+                                  or "voter still owns sync" in proc.stdout)
+                  if not evidence:
+                      raise SystemExit("Failure did not demonstrate the intended regression assertion")
 
           subprocess.run(["git", "restore", "--source=" + os.environ["BASE"], "--", production], check=True)
           try:
               baseline = build()
               for case in regressions:
-                  run(baseline, ["--exact", case], [case], False)
+                  name = baseline[3][case]
+                  run(baseline, ["--exact", name], [name], False)
           finally:
               subprocess.run(["git", "restore", "--source=HEAD", "--", production], check=True)
           fixed = build()
@@ -134,7 +162,7 @@ jobs:
               selected = [s for s in fixed[2] if s.startswith("metadata::")]
               run(fixed, ["--exact", *selected], selected, True)
           else:
-              selected = regressions + controls
+              selected = [fixed[3][case] for case in regressions + controls]
               for case in selected:
                   run(fixed, ["--exact", case], [case], True)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
