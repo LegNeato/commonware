@@ -48,26 +48,30 @@ jobs:
           git("merge-base", "--is-ancestor", head, "refs/remotes/origin/" + branch)
           git("checkout", "--detach", head)
           with open(os.environ["GITHUB_ENV"], "a") as env:
+              release = branch == "maintenance-2026.9"
+              # September 3 release CI used floating stable and pinned its rustfmt nightly.
+              print("TEST_TOOLCHAIN=" + ("1.98.1" if release else "1.100.0"), file=env)
+              print("FMT_TOOLCHAIN=" + ("nightly-2026-06-21" if release else "nightly-2026-11-12"), file=env)
               print("BASE=" + base, file=env)
               print("PACKAGE=commonware-" + {"storage": "storage", "simplex": "consensus"}[os.environ["SUITE"]], file=env)
           print(f"Checking {branch} at {head} against {base}", flush=True)
       - name: Install test toolchain
         if: matrix.check == 'tests'
-        run: rustup toolchain install 1.100.0 --profile minimal
+        run: rustup toolchain install "$TEST_TOOLCHAIN" --profile minimal
       - name: Check formatting and Clippy
         if: matrix.check == 'lint'
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install nightly-2026-11-12 --profile minimal --component rustfmt
-          rustup toolchain install 1.100.0 --profile minimal --component clippy
+          rustup toolchain install "$FMT_TOOLCHAIN" --profile minimal --component rustfmt
+          rustup toolchain install "$TEST_TOOLCHAIN" --profile minimal --component clippy
           crate=storage
           if [[ $SUITE == simplex ]]; then crate=consensus; fi
           git diff --name-only --diff-filter=ACMR -z "$BASE" HEAD -- "$crate/" |
             while IFS= read -r -d '' path; do
-              if [[ $path == *.rs ]]; then rustfmt +nightly-2026-11-12 --edition 2024 --check "$path"; fi
+              if [[ $path == *.rs ]]; then rustfmt "+$FMT_TOOLCHAIN" --edition 2024 --check "$path"; fi
             done
-          cargo +1.100.0 clippy --locked -p "$PACKAGE" --lib --tests -- -D warnings
+          cargo "+$TEST_TOOLCHAIN" clippy --locked -p "$PACKAGE" --lib --tests -- -D warnings
       - name: Demonstrate baseline failure, then verify fixed behavior
         if: matrix.check == 'tests'
         shell: python
@@ -88,7 +92,7 @@ jobs:
                           "simplex::tests::network_failure_stops_engine_with_pending_voter_sync"]
 
           def build():
-              cmd = ["cargo", "+1.100.0", "test", "--locked", "-p", os.environ["PACKAGE"],
+              cmd = ["cargo", "+" + os.environ["TEST_TOOLCHAIN"], "test", "--locked", "-p", os.environ["PACKAGE"],
                      "--lib", "--no-run", "--message-format=json-render-diagnostics"]
               output = subprocess.check_output(cmd, text=True)
               events = [json.loads(line) for line in output.splitlines()]
@@ -123,9 +127,15 @@ jobs:
               summary = (rf"test result: {status}\. {count if passing else 0} passed; "
                          rf"{0 if passing else count} failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s")
               lines = proc.stdout.splitlines()
-              rows = [s for s in lines if s.startswith("test ") and " ... " in s]
+              rows = []
+              for line in lines:
+                  if line.startswith("test ") and " ... " in line:
+                      name, _, outcome = line[5:].rpartition(" ... ")
+                      if passing:
+                          name = name.removesuffix(" - should panic")
+                      rows.append((name, outcome))
               if (proc.returncode != (0 if passing else 101)
-                      or sorted(rows) != sorted(f"test {case} ... {status}" for case in expected)
+                      or sorted(rows) != sorted((case, status) for case in expected)
                       or len([s for s in lines if re.fullmatch(summary, s)]) != 1):
                   raise SystemExit("Missing expected libtest evidence")
               if not passing:
