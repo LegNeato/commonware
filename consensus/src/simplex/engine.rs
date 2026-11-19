@@ -15,6 +15,7 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{
     BufferPooler, Clock, ContextCell, Handle, Metrics, Spawner, Storage, spawn_cell,
 };
+use futures::FutureExt as _;
 use rand_core::CryptoRng;
 use tracing::debug;
 
@@ -251,6 +252,7 @@ impl<
             },
             voter = &mut voter_task => {
                 debug!(?voter, "voter stopped, shutting down engine");
+                return;
             },
             batcher = &mut batcher_task => {
                 debug!(?batcher, "batcher stopped, shutting down engine");
@@ -258,6 +260,13 @@ impl<
             resolver = &mut resolver_task => {
                 debug!(?resolver, "resolver stopped, shutting down engine");
             },
+        }
+
+        // Returning from the supervisor aborts its children. On graceful shutdown
+        // the voter must finish syncing its journal, even if a sibling exits first.
+        if self.context.stopped().now_or_never().is_some() {
+            let voter = voter_task.await;
+            debug!(?voter, "voter stopped after shutdown");
         }
     }
 }
