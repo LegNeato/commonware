@@ -83,8 +83,8 @@ jobs:
               controls = ["metadata::tests::test_recover_corrupted_one", "metadata::tests::test_recover_corrupted_both"]
           else:
               production = "consensus/src/simplex/engine.rs"
-              regressions = ["simplex::tests::test_graceful_shutdown_ed25519_slow_"]
-              controls = ["simplex::tests::test_children_shutdown_on_engine_abort_ed25519_slow_",
+              regressions = ["simplex::tests::test_graceful_shutdown_ed25519"]
+              controls = ["simplex::tests::test_children_shutdown_on_engine_abort_ed25519",
                           "simplex::tests::network_failure_stops_engine_with_pending_voter_sync"]
 
           def build():
@@ -100,13 +100,20 @@ jobs:
                           and e["target"]["src_path"] == str(package / "src/lib.rs")]
               binary, = binaries
               lines = subprocess.check_output([binary, "--list", "--format=terse"], cwd=package, text=True).splitlines()
+              names = [s[:-6] for s in lines if s.endswith(": test")]
+              exact = {}
               for case in regressions + controls:
-                  if lines.count(case + ": test") != 1:
-                      raise SystemExit(f"Expected exactly one registration for {case}")
-              return binary, package, [s[:-6] for s in lines if s.endswith(": test")]
+                  choices = {case}
+                  if suite == "simplex" and case.endswith("_ed25519"):
+                      choices.add(case + "_slow_")
+                  matches = [name for name in names if name in choices]
+                  if len(matches) != 1:
+                      raise SystemExit(f"Expected one named registration for {case}, found {matches}")
+                  exact[case] = matches[0]
+              return binary, package, names, exact
 
           def run(artifact, filters, expected, passing):
-              exe, cwd, _ = artifact
+              exe, cwd, _, _ = artifact
               cmd = [exe, *filters, "--test-threads=2", "--format=pretty", "--color=never"]
               proc = subprocess.run(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, timeout=1200)
@@ -121,12 +128,23 @@ jobs:
                       or sorted(rows) != sorted(f"test {case} ... {status}" for case in expected)
                       or len([s for s in lines if re.fullmatch(summary, s)]) != 1):
                   raise SystemExit("Missing expected libtest evidence")
+              if not passing:
+                  flat = "".join(proc.stdout.split())
+                  if suite == "storage":
+                      codec = "U64,u16" if "checksum" in expected[0] else "u8,u8"
+                      evidence = "assertionfailed:matches!(" in flat and f"Metadata::<_,{codec}>" in flat
+                  else:
+                      evidence = ("assertion failed:" in proc.stdout and "now_or_never().is_none()" in flat
+                                  or "voter still owns sync" in proc.stdout)
+                  if not evidence:
+                      raise SystemExit("Failure did not demonstrate the intended regression assertion")
 
           subprocess.run(["git", "restore", "--source=" + os.environ["BASE"], "--", production], check=True)
           try:
               baseline = build()
               for case in regressions:
-                  run(baseline, ["--exact", case], [case], False)
+                  name = baseline[3][case]
+                  run(baseline, ["--exact", name], [name], False)
           finally:
               subprocess.run(["git", "restore", "--source=HEAD", "--", production], check=True)
           fixed = build()
@@ -134,7 +152,7 @@ jobs:
               selected = [s for s in fixed[2] if s.startswith("metadata::")]
               run(fixed, ["--exact", *selected], selected, True)
           else:
-              selected = regressions + controls
+              selected = [fixed[3][case] for case in regressions + controls]
               for case in selected:
                   run(fixed, ["--exact", case], [case], True)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
