@@ -149,6 +149,26 @@ jobs:
                   if not evidence:
                       raise SystemExit("Failure did not demonstrate the intended regression assertion")
 
+          def run_metadata(artifact):
+              exe, cwd, _, exact = artifact
+              result = subprocess.run([exe, "metadata::tests::", "--test-threads=2", "--format=pretty", "--color=never"],
+                                      cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1200)
+              print(result.stdout, flush=True)
+              lines = result.stdout.splitlines()
+              summaries = [line for line in lines if line.startswith("test result:")]
+              pattern = (r"test result: ok\. ([1-9][0-9]*) passed; 0 failed; 0 ignored; 0 measured; "
+                         r"[0-9]+ filtered out; finished in [0-9.]+s")
+              match = re.fullmatch(pattern, summaries[0]) if len(summaries) == 1 else None
+              if result.returncode or not match:
+                  raise SystemExit(f"Metadata suite exit {result.returncode}, summaries {summaries}")
+              for case in regressions + controls:
+                  if lines.count(f"test {exact[case]} ... ok") != 1:
+                      raise SystemExit(f"Missing exact metadata regression or control pass: {case}")
+              count = int(match[1])
+              if lines.count(f"running {count} tests") != 1 or count < len(regressions + controls):
+                  raise SystemExit(f"Inconsistent metadata suite count: {count}")
+              return count
+
           subprocess.run(["git", "restore", "--source=" + os.environ["BASE"], "--", production], check=True)
           try:
               baseline = build()
@@ -159,11 +179,11 @@ jobs:
               subprocess.run(["git", "restore", "--source=HEAD", "--", production], check=True)
           fixed = build()
           if suite == "storage":
-              selected = [s for s in fixed[2] if s.startswith("metadata::")]
-              run(fixed, ["--exact", *selected], selected, True)
+              count = run_metadata(fixed)
           else:
               selected = [fixed[3][case] for case in regressions + controls]
+              count = len(selected)
               for case in selected:
                   run(fixed, ["--exact", case], [case], True)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-              print(f"{suite}: {len(regressions)} expected baseline failures and {len(selected)} candidate passes.", file=summary)
+              print(f"{suite}: {len(regressions)} expected baseline failures and {count} candidate passes.", file=summary)
